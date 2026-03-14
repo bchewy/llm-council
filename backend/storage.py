@@ -3,7 +3,7 @@
 import json
 import os
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 from .config import DATA_DIR
 
@@ -131,7 +131,7 @@ def add_assistant_message(
     conversation_id: str,
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
-    stage3: Dict[str, Any]
+    stage3: Any
 ):
     """
     Add an assistant message with all 3 stages to a conversation.

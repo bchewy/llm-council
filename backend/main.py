@@ -10,7 +10,9 @@ import json
 import asyncio
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings, _build_chairman_prompt
+from .openrouter import query_model, query_models_progressive
+from .config import COUNCIL_MODELS, CHAIRMAN_MODELS
 
 app = FastAPI(title="LLM Council API")
 
@@ -147,21 +149,59 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
-            # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            # Stage 1: Stream individual model responses as they arrive
+            messages = [{"role": "user", "content": request.content}]
+            yield f"data: {json.dumps({'type': 'stage1_start', 'total': len(COUNCIL_MODELS)})}\n\n"
+
+            stage1_results = []
+            async for model, response in query_models_progressive(COUNCIL_MODELS, messages):
+                if response is not None:
+                    entry = {"model": model, "response": response.get('content', ''), "duration_ms": response.get('duration_ms')}
+                    stage1_results.append(entry)
+                    yield f"data: {json.dumps({'type': 'stage1_model_complete', 'data': entry})}\n\n"
+
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
-            # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            # Stage 2: Stream individual rankings as they arrive
+            from .council import _build_ranking_prompt, parse_ranking_from_text
+            labels = [chr(65 + i) for i in range(len(stage1_results))]
+            label_to_model = {
+                f"Response {label}": result['model']
+                for label, result in zip(labels, stage1_results)
+            }
+            ranking_prompt = _build_ranking_prompt(request.content, stage1_results, labels)
+            ranking_messages = [{"role": "user", "content": ranking_prompt}]
+
+            yield f"data: {json.dumps({'type': 'stage2_start', 'total': len(COUNCIL_MODELS)})}\n\n"
+
+            stage2_results = []
+            async for model, response in query_models_progressive(COUNCIL_MODELS, ranking_messages):
+                if response is not None:
+                    full_text = response.get('content', '')
+                    parsed = parse_ranking_from_text(full_text)
+                    entry = {"model": model, "ranking": full_text, "parsed_ranking": parsed, "duration_ms": response.get('duration_ms')}
+                    stage2_results.append(entry)
+                    yield f"data: {json.dumps({'type': 'stage2_model_complete', 'data': entry})}\n\n"
+
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
-            # Stage 3: Synthesize final answer
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+            # Stage 3: Stream chairman syntheses as they arrive
+            yield f"data: {json.dumps({'type': 'stage3_start', 'total': len(CHAIRMAN_MODELS)})}\n\n"
+
+            chairman_prompt = _build_chairman_prompt(request.content, stage1_results, stage2_results)
+            chairman_messages = [{"role": "user", "content": chairman_prompt}]
+
+            stage3_results = []
+            async for model, response in query_models_progressive(CHAIRMAN_MODELS, chairman_messages):
+                if response is not None:
+                    entry = {"model": model, "response": response.get('content', ''), "duration_ms": response.get('duration_ms')}
+                else:
+                    entry = {"model": model, "response": "Error: Unable to generate final synthesis."}
+                stage3_results.append(entry)
+                yield f"data: {json.dumps({'type': 'stage3_model_complete', 'data': entry})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_results})}\n\n"
 
             # Wait for title generation if it was started
             if title_task:
@@ -174,7 +214,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 conversation_id,
                 stage1_results,
                 stage2_results,
-                stage3_result
+                stage3_results
             )
 
             # Send completion event
